@@ -104,6 +104,13 @@ def _accepts_prompt_cache_breakpoint(block: object) -> bool:
     return isinstance(block, dict) and block.get("type") in OPENAI_PROMPT_CACHE_BREAKPOINT_BLOCK_TYPES
 
 
+# Set by a caller whose message list is not the one that goes upstream -- today the
+# Responses API layer, whose `instructions` only becomes a system message further down.
+# Tells this hook to hand back the message points that matched nothing here instead of
+# dropping them, so the layer holding the final messages still gets to place them.
+CARRY_UNMATCHED_MESSAGE_POINTS: Final = "_litellm_carry_unmatched_cache_control_points"
+
+
 class AnthropicCacheControlHook(CustomPromptManagement):
     def get_chat_completion_prompt(
         self,
@@ -128,6 +135,7 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         - non_default_params: dict - params with any global cache controls
         """
         # Extract cache control injection points
+        carry_unmatched: Final = bool(non_default_params.pop(CARRY_UNMATCHED_MESSAGE_POINTS, False))
         injection_points: Final[list[CacheControlInjectionPoint]] = non_default_params.pop(
             "cache_control_injection_points", []
         )
@@ -146,10 +154,12 @@ class AnthropicCacheControlHook(CustomPromptManagement):
             else:
                 remaining_points.append(point)
 
-        # Non-message points (currently Bedrock tool_config) are handled in the
-        # provider transform, where each tool_config point appends at most one
-        # cachePoint to the tools. That block also counts toward Anthropic's
-        # limit, so reserve a slot for it here to leave room.
+        # Points another layer will place still cost a block against Anthropic's limit:
+        # a tool_config point appends at most one cachePoint in the provider transform,
+        # and each carried point below is placed on the next pass. Reserve a slot for
+        # each so this pass cannot fill the cap and starve them -- config order says
+        # earlier points win when slots are scarce, and without the reservation a point
+        # listed first would lose to later ones simply for being carried.
         stamped_dialect: Final = injection_points[0].get("_litellm_openai_dialect")
         openai_dialect: Final = (
             stamped_dialect
@@ -161,9 +171,24 @@ class AnthropicCacheControlHook(CustomPromptManagement):
                 non_default_params.get("prompt_cache_options"),
             )
         )
+        # Points that outlive this pass, decided before any budget is spent. Only a
+        # role-targeted point can: an ordinal addresses the list in front of us, and the
+        # same ordinal names a different message once a later layer builds its own, so a
+        # positional point is resolved here or not at all (an index wins over a role in
+        # `_resolve_target_indices`, so `index` alone decides).
+        carried_message_points: Final[Sequence[CacheControlInjectionPoint]] = (
+            tuple(
+                point
+                for point in message_points
+                if point.get("index") is None
+                and not AnthropicCacheControlHook._resolve_target_indices(point, processed_messages)
+            )
+            if carry_unmatched
+            else ()
+        )
         reserved_blocks: Final = (
             1 if not openai_dialect and any(p.get("location") == "tool_config" for p in remaining_points) else 0
-        )
+        ) + len(carried_message_points)
         breakpoints_before: Final = AnthropicCacheControlHook._count_request_cache_breakpoints(processed_messages)
         processed_messages = self._apply_message_injections(
             points=message_points,
@@ -177,10 +202,18 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         ):
             non_default_params.setdefault("prompt_cache_options", PromptCacheOptions(mode="explicit"))
 
-        # Pass through non-message injection points for provider-specific handling
-        if remaining_points:
+        # Pass through the points this pass did not spend: non-message ones for the
+        # provider transform, and the role-targeted ones held back above. A point can
+        # match nothing here because this is not the last layer to see the request: the
+        # Responses API keeps its system prompt in `instructions`, which only becomes a
+        # system message once the chat-completion bridge builds one. Dropping those
+        # stranded the directive and left the whole surface uncached. The judged stamp is
+        # what makes carrying them safe -- the next pass must not re-judge points against
+        # messages this pass has already marked (see `_should_stand_down`).
+        carried_points: Final[Sequence[CacheControlInjectionPoint]] = (*remaining_points, *carried_message_points)
+        if carried_points:
             non_default_params["cache_control_injection_points"] = AnthropicCacheControlHook._stamped_as_judged(
-                remaining_points
+                carried_points
             )
 
         return model, processed_messages, non_default_params
