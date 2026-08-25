@@ -41,11 +41,17 @@ def is_anthropic_ping_chunk(chunk: object) -> bool:
     and can recur indefinitely on a slow-starting or idle connection, so a
     mid-stream fallback wrapper drops it outright while still deciding
     whether to commit to the primary stream, rather than buffering it.
+
+    A physical transport chunk that coalesces a ping with any other SSE
+    event (``message_start``, ``content_block_delta``, ``event: error``, ...)
+    is NOT a pure ping - dropping it whole would discard those events - so
+    only a chunk whose every ``event:`` line is ``event: ping`` qualifies.
     """
     if isinstance(chunk, dict):
         return chunk.get("type") == "ping"
     if isinstance(chunk, (bytes, bytearray)):
-        return any(line == b"event: ping" for line in chunk.splitlines())
+        event_lines: Final = tuple(line for line in chunk.splitlines() if line.startswith(b"event:"))
+        return bool(event_lines) and all(line == b"event: ping" for line in event_lines)
     return False
 
 

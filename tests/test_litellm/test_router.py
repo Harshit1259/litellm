@@ -9168,6 +9168,46 @@ async def test_anthropic_messages_pre_content_buffer_cap_forces_commit():
     assert collected[-1] == error_chunk
 
 
+@pytest.mark.asyncio
+async def test_anthropic_messages_ping_coalesced_with_content_in_one_physical_chunk_is_forwarded():
+    """Greptile/Bugbot regression: transport-level buffering can coalesce a
+    `ping` keepalive and a real content_block_delta into ONE physical read.
+    The pre-content ping-drop must only discard PURE ping frames - dropping
+    the whole coalesced chunk would silently lose generated content."""
+    router = _anthropic_messages_make_router()
+    coalesced_chunk = _anthropic_messages_ping_chunk() + _anthropic_messages_content_chunk("hi")
+    source = _AnthropicMessagesFakeByteStream([coalesced_chunk])
+
+    wrapped = await router._aanthropic_messages_streaming_iterator(response=source, initial_kwargs={"model": "primary"})
+    collected = [chunk async for chunk in wrapped]
+
+    assert collected == [coalesced_chunk]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_ping_coalesced_with_retriable_error_still_falls_back():
+    """Greptile/Bugbot regression: a physical chunk coalescing a `ping` with a
+    retriable `event: error` must not be discarded as a keepalive - the error
+    inside it must still trigger the mid-stream fallback."""
+    router = _anthropic_messages_make_router()
+    coalesced_chunk = _anthropic_messages_ping_chunk() + _anthropic_messages_overloaded_error_chunk()
+    source = _AnthropicMessagesFakeByteStream([coalesced_chunk])
+    fallback_stream = _AnthropicMessagesFallbackByteStream([_anthropic_messages_content_chunk("fallback answer")])
+
+    with patch.object(
+        router,
+        "async_function_with_fallbacks_common_utils",
+        new=AsyncMock(return_value=fallback_stream),
+    ) as mock_fallback:
+        wrapped = await router._aanthropic_messages_streaming_iterator(
+            response=source, initial_kwargs={"model": "primary"}
+        )
+        collected = [chunk async for chunk in wrapped]
+
+    mock_fallback.assert_awaited_once()
+    assert collected == [_anthropic_messages_content_chunk("fallback answer")]
+
+
 # -------- _aanthropic_messages_fallback_attempt --------
 
 
