@@ -3392,6 +3392,7 @@ async def _run_direct_health_check_with_instrumentation(
     last_type_error: TypeError | None = None
     for extra_kwargs in (
         {
+            "router": llm_router,
             "instrumentation_context": instrumentation_context,
             **_hc_filter,
         },
@@ -3666,6 +3667,7 @@ async def _run_background_health_check():
                     model_list=_llm_model_list,
                     details=details_bool,
                     max_concurrency=health_check_concurrency,
+                    router=llm_router,
                     **_hc_filter,
                 )
             except Exception as e:

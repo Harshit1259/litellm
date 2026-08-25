@@ -6,10 +6,14 @@ import random
 import sys
 import threading
 import time
-from collections.abc import Mapping
-from typing import Final
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final
 
 import litellm
+
+if TYPE_CHECKING:
+    from litellm.router import Router
 
 logger: Final = logging.getLogger(__name__)
 from litellm.constants import (
@@ -18,7 +22,11 @@ from litellm.constants import (
     DEFAULT_HEALTH_CHECK_PROMPT,
     HEALTH_CHECK_TIMEOUT_SECONDS,
 )
-from litellm.router_utils.auto_router_model_naming import classify_strategy_router_model
+from litellm.router_utils.auto_router_model_naming import (
+    StrategyRouterDependency,
+    classify_strategy_router_model,
+    strategy_router_dependencies,
+)
 
 ILLEGAL_DISPLAY_PARAMS: Final = [
     "messages",
@@ -151,7 +159,7 @@ def health_check_filter_kwargs_from_general_settings(
 
 
 def filter_deployments_by_id(
-    model_list: list,
+    model_list: Sequence[Mapping[str, object]],
 ) -> list:
     seen_ids: Final = set()
     filtered_deployments: Final = []
@@ -183,10 +191,237 @@ async def run_with_timeout(task, timeout):
         return {"error": "Timeout exceeded", "exception": timeout_exception}
 
 
-def _is_strategy_router_deployment(litellm_params: dict) -> bool:
+def _skips_health_checks(deployment: Mapping[str, object]) -> bool:
+    info: Final = deployment.get("model_info")
+    return bool(info.get("disable_background_health_check", False)) if isinstance(info, Mapping) else False
+
+
+def _health_check_eligible(
+    model_list: Sequence[Mapping[str, object]], skip_disabled: bool
+) -> tuple[Mapping[str, object], ...]:
+    """Deployments this run is allowed to contact.
+
+    The one gate for probe eligibility, applied to the requested set and to the pool a
+    router's dependencies are drawn from alike, so an opted-out deployment cannot re-enter
+    through a router that happens to depend on it.
+    """
+    if not skip_disabled:
+        return tuple(model_list)
+    return tuple(x for x in model_list if not _skips_health_checks(x))
+
+
+def _deployment_model(deployment: Mapping[str, object]) -> str | None:
+    params: Final = deployment.get("litellm_params")
+    return params.get("model") if isinstance(params, Mapping) else None
+
+
+def _narrow_to_target(
+    model_list: Sequence[Mapping[str, object]], model: str | None, model_id: str | None
+) -> tuple[Mapping[str, object], ...]:
+    """Narrow to the requested deployment. An id matching nothing keeps the whole list."""
+    if model_id is not None:
+        by_id: Final = tuple(x for x in model_list if _deployment_id(x) == model_id)
+        return by_id or tuple(model_list)
+    if model is None:
+        return tuple(model_list)
+    by_param: Final = tuple(x for x in model_list if _deployment_model(x) == model)
+    return by_param or tuple(x for x in model_list if x.get("model_name") == model)
+
+
+def _is_strategy_router_deployment(litellm_params: Mapping[str, object]) -> bool:
     """True for strategy-router deployments."""
     model: Final[object] = litellm_params.get("model", "")
     return isinstance(model, str) and classify_strategy_router_model(model) is not None
+
+
+def _is_marker(deployment: Mapping[str, object]) -> bool:
+    params: Final = deployment.get("litellm_params")
+    return isinstance(params, Mapping) and _is_strategy_router_deployment(params)
+
+
+def _deployment_id(deployment: Mapping[str, object]) -> str | None:
+    info: Final = deployment.get("model_info")
+    ident: Final = info.get("id") if isinstance(info, Mapping) else None
+    return str(ident) if ident else None
+
+
+def _resolved_deployment_ids(router: "Router", model_name: str) -> frozenset[str] | None:
+    """Deployment ids backing `model_name`, or None when the name resolves to nothing.
+
+    Resolution goes through `get_model_list`, which composes every channel the request path
+    itself uses: exact name, model_group_alias, routing groups and wildcard patterns. A
+    mirror of any single channel would report a working tier as broken. An alias whose
+    target no longer exists resolves to nothing, which is the same fault as an unknown
+    name, since a request through it fails the same way.
+    """
+    resolved: Final = router.get_model_list(model_name=model_name)
+    if not resolved:
+        return None
+    return frozenset(ident for entry in resolved if (ident := _deployment_id(entry)))
+
+
+def _dependency_failure(
+    dependency: StrategyRouterDependency,
+    router: "Router",
+    visible_ids: frozenset[str],
+    unhealthy_ids: frozenset[str],
+) -> str | None:
+    """Why this dependency makes its router unable to serve, or None when it does not.
+
+    Silent (None) whenever the answer is unknown rather than good: a dependency whose
+    deployments the caller cannot see is not evidence of a fault, so it never reds a router.
+    """
+    resolved: Final = _resolved_deployment_ids(router, dependency.model_name)
+    if resolved is None:
+        return f"{dependency.role} model '{dependency.model_name}' matches no deployment on this proxy"
+    visible: Final = resolved & visible_ids
+    if not visible or not visible <= unhealthy_ids:
+        return None
+    return f"{dependency.role} model '{dependency.model_name}' has no healthy deployment"
+
+
+def _strategy_router_dependency_error(
+    deployment: Mapping[str, object],
+    router: "Router",
+    visible_ids: frozenset[str],
+    unhealthy_ids: frozenset[str],
+) -> str | None:
+    """The first dependency fault that makes this router unable to serve, if any."""
+    params: Final = deployment.get("litellm_params")
+    if not isinstance(params, Mapping):
+        return None
+    return next(
+        (
+            failure
+            for dependency in strategy_router_dependencies(params)
+            if (failure := _dependency_failure(dependency, router, visible_ids, unhealthy_ids))
+        ),
+        None,
+    )
+
+
+def _dependency_deployments_to_probe(
+    checked: Sequence[Mapping[str, object]],
+    universe: Sequence[Mapping[str, object]],
+    router: "Router",
+) -> tuple[Mapping[str, object], ...]:
+    """Deployments backing the checked routers' dependencies that are not already checked.
+
+    Empty on a full-list run, where every dependency is in `checked` already, so that path
+    gains no probe. It is the targeted `/health?model_id=<router>` call the dashboard makes
+    per deployment that needs them, since a router's verdict is a statement about models the
+    request never named. Drawn from `universe` (the caller's access-filtered list) so a
+    targeted check can never probe a deployment the caller was not already granted.
+    """
+    names: Final = frozenset(
+        dependency.model_name
+        for deployment in checked
+        if isinstance(params := deployment.get("litellm_params"), Mapping)
+        for dependency in strategy_router_dependencies(params)
+    )
+    if not names:
+        return ()
+    checked_ids: Final = frozenset(cid for d in checked if (cid := _deployment_id(d)))
+    needed: Final[frozenset[str]] = frozenset(
+        ident for name in names for ident in (_resolved_deployment_ids(router, name) or ())
+    )
+    return tuple(d for d in universe if (uid := _deployment_id(d)) and uid in needed and uid not in checked_ids)
+
+
+def _settle_router_verdicts(
+    markers: Mapping[str, Mapping[str, object]],
+    router: "Router",
+    visible_ids: frozenset[str],
+    probe_failures: frozenset[str],
+    settled: Mapping[str, str],
+    rounds_left: int,
+) -> Mapping[str, str]:
+    """Judge markers until no new one turns red.
+
+    A router that routes to another router depends on a marker, and a marker never fails a
+    probe of its own, so one pass can only ever see probe failures and the parent of a red
+    child stays green. Each round feeds the previous round's verdicts back in as unhealthy.
+    Bounded by the marker count, which is what makes a router cycle terminate (green, since
+    no round adds a verdict) instead of recursing forever.
+    """
+    if rounds_left <= 0:
+        return settled
+    unhealthy_now: Final = probe_failures | frozenset(settled)
+    fresh: Final = {
+        marker_id: error
+        for marker_id, deployment in markers.items()
+        if marker_id not in settled
+        if (error := _strategy_router_dependency_error(deployment, router, visible_ids, unhealthy_now))
+    }
+    if not fresh:
+        return settled
+    return _settle_router_verdicts(
+        markers, router, visible_ids, probe_failures, MappingProxyType({**settled, **fresh}), rounds_left - 1
+    )
+
+
+def _strategy_router_verdicts(
+    healthy_endpoints: Sequence[Mapping[str, object]],
+    unhealthy_endpoints: Sequence[Mapping[str, object]],
+    checked: Sequence[Mapping[str, object]],
+    router: "Router",
+) -> Mapping[str, str]:
+    """The dependency fault, per model id, for every strategy router that cannot serve.
+
+    A marker is filed healthy by `_run_model_health_check` returning `{}`, which says only
+    that nothing was probed. This is where that placeholder becomes a verdict, derived from
+    the results this same run just produced rather than from a re-probe or a cache that is
+    empty unless `enable_health_check_routing` is on.
+    """
+    by_id: Final = MappingProxyType({i: d for d in checked if (i := _deployment_id(d))})
+    markers: Final = MappingProxyType(
+        {
+            marker_id: by_id[marker_id]
+            for endpoint in healthy_endpoints
+            if isinstance(marker_id := endpoint.get("model_id"), str) and marker_id in by_id
+            if _is_marker(by_id[marker_id])
+        }
+    )
+    probe_failures: Final = frozenset(
+        ident for endpoint in unhealthy_endpoints if isinstance(ident := endpoint.get("model_id"), str)
+    )
+    return _settle_router_verdicts(
+        markers, router, frozenset(by_id), probe_failures, MappingProxyType({}), len(markers)
+    )
+
+
+def _finalize_strategy_router_endpoints(
+    healthy_endpoints: Sequence[Mapping[str, object]],
+    unhealthy_endpoints: Sequence[Mapping[str, object]],
+    checked: Sequence[Mapping[str, object]],
+    router: "Router | None",
+    dependency_probes: Sequence[Mapping[str, object]],
+) -> tuple[tuple[Mapping[str, object], ...], tuple[Mapping[str, object], ...]]:
+    """Apply router verdicts, then drop the deployments probed only to reach them.
+
+    The probes exist to judge the routers that depend on them; reporting them would answer a
+    targeted request with deployments the caller never asked about.
+    """
+    verdicts: Final = (
+        _strategy_router_verdicts(healthy_endpoints, unhealthy_endpoints, checked, router)
+        if router is not None
+        else MappingProxyType({})
+    )
+    dropped: Final = frozenset(i for d in dependency_probes if (i := _deployment_id(d)))
+
+    def keep(endpoint: Mapping[str, object]) -> bool:
+        model_id: Final = endpoint.get("model_id")
+        return not (isinstance(model_id, str) and model_id in dropped)
+
+    return (
+        tuple(e for e in healthy_endpoints if keep(e) and e.get("model_id") not in verdicts),
+        tuple(e for e in unhealthy_endpoints if keep(e))
+        + tuple(
+            dict(e, error=verdicts[mid])  # mutable-ok: the /health payload must stay a plain JSON-serializable dict
+            for e in healthy_endpoints
+            if keep(e) and (mid := e.get("model_id")) in verdicts
+        ),
+    )
 
 
 async def _run_model_health_check(model: dict):
@@ -531,6 +766,7 @@ async def perform_health_check(
     max_concurrency: int | None = None,
     instrumentation_context: dict | None = None,
     health_check_skip_disabled_background_models: bool = False,
+    router: "Router | None" = None,
 ):
     """
     Perform a health check on the system.
@@ -567,23 +803,9 @@ async def perform_health_check(
 
     cycle_start_time: Final = time.monotonic()
     requested_model_count: Final = len(model_list)
-
-    # Filter by model_id first so a single deployment is checked when id is specified
-    if model_id is not None:
-        _by_id: Final = [x for x in model_list if (x.get("model_info") or {}).get("id") == model_id]
-        if _by_id:
-            model_list = _by_id
-    elif model is not None:
-        _new_model_list = [x for x in model_list if x["litellm_params"]["model"] == model]
-        if _new_model_list == []:
-            _new_model_list = [x for x in model_list if x["model_name"] == model]
-        model_list = _new_model_list
-
-    if health_check_skip_disabled_background_models:
-        model_list = [
-            x for x in model_list if not (x.get("model_info") or {}).get("disable_background_health_check", False)
-        ]
-    if not model_list:
+    skip_disabled: Final = health_check_skip_disabled_background_models
+    narrowed: Final = _health_check_eligible(_narrow_to_target(model_list, model, model_id), skip_disabled)
+    if not narrowed:
         if instrumentation_enabled:
             logger.debug(
                 "health_check_cycle_skipped source=%s cycle_id=%s reason=no_models_after_filter",
@@ -592,11 +814,16 @@ async def perform_health_check(
             )
         return [], [], {}
 
-    post_filter_model_count: Final = len(model_list)
-    model_list = filter_deployments_by_id(
-        model_list=model_list
-    )  # filter duplicate deployments (e.g. when model alias'es are used)
-    deduped_model_count: Final = len(model_list)
+    post_filter_model_count: Final = len(narrowed)
+    requested: Final = filter_deployments_by_id(model_list=narrowed)
+    deduped_model_count: Final = len(requested)
+
+    dependency_probes: Final = (
+        _dependency_deployments_to_probe(requested, _health_check_eligible(model_list, skip_disabled), router)
+        if router is not None
+        else ()
+    )
+    checked: Final = requested + list(dependency_probes)  # mutable-ok: _perform_health_check takes a list
 
     if instrumentation_enabled:
         logger.debug(
@@ -613,14 +840,17 @@ async def perform_health_check(
 
     try:
         (
-            healthy_endpoints,
-            unhealthy_endpoints,
+            probed_healthy,
+            probed_unhealthy,
             exceptions_by_model_id,
         ) = await _perform_health_check(
-            model_list,
+            checked,
             details,
             max_concurrency=max_concurrency,
             instrumentation_context=instrumentation_context,
+        )
+        healthy_endpoints, unhealthy_endpoints = _finalize_strategy_router_endpoints(
+            probed_healthy, probed_unhealthy, checked, router, dependency_probes
         )
     except Exception:
         if instrumentation_enabled:
